@@ -10,6 +10,11 @@ echo "  Stock ROM: $STOCK_ROM"
 echo "  U-Boot:    $UBOOT"
 echo "  Env:       $ENV"
 
+for d in proc sys tmp dev; do
+    mkdir -p "rootfs/$d"
+done
+chmod 1777 "rootfs/tmp"
+
 # Copy U-Boot and env into rootfs
 cp "$UBOOT" rootfs/uboot.bin
 cp "$ENV" rootfs/uboot-env.bin
