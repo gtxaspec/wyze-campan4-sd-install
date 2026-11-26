@@ -23,7 +23,7 @@ CHIP_SIZE=16777216
 UBOOT_OFF=0
 ENV_OFF=327680
 BS=4096
-STOCK_LAYOUT="uboot:192 boot:4544 system:5632 back:5632 cfg:320 provisioning:64"
+STOCK_LAYOUT="uboot:196608 boot:4653056 system:5767168 back:5767168 cfg:327680 provisioning:65536"
 FAIL=0
 
 abort() {
@@ -41,13 +41,23 @@ sha() {
 # The stock kernel splits the chip with mtdparts, so /dev/mtd0 is only the
 # 192 KiB uboot partition. Map chip offsets onto the mtd devices instead.
 PARTS=""
+LAYOUT=""
+NPARTS=0
 OFF=0
 while read -r DEV SIZE ESIZE NAME; do
   case "$DEV" in mtd*:) ;; *) continue ;; esac
+  DEV=${DEV%:}
   SIZE=$((0x$SIZE))
-  PARTS="$PARTS ${DEV%:}:$OFF:$SIZE"
+  NAME=${NAME#\"}; NAME=${NAME%\"}
+  case "$NAME" in ""|*[!A-Za-z0-9_-]*) NAME=$DEV ;; esac
+  PARTS="$PARTS $DEV:$OFF:$SIZE"
+  LAYOUT="$LAYOUT $NAME:$SIZE"
+  NPARTS=$((NPARTS + 1))
   OFF=$((OFF + SIZE))
 done < /proc/mtd
+# No mtdparts on the command line: one mtd for the whole chip, split it by
+# the stock layout instead.
+[ $NPARTS -gt 1 ] || LAYOUT=$STOCK_LAYOUT
 
 # chip_io r|w FILE CHIPOFF LEN: copy LEN bytes between FILE (from its start)
 # and the chip at CHIPOFF, across partition boundaries.
@@ -101,8 +111,8 @@ echo "  MTD layout:"
 cat /proc/mtd
 [ $OFF -eq $CHIP_SIZE ] || abort "MTD partitions cover $OFF bytes, expected $CHIP_SIZE"
 for P in $PARTS; do
-  DEV=${P%%:*}; REST=${P#*:}; PSTART=${REST%%:*}
-  [ $((PSTART % BS)) -eq 0 ] || abort "$DEV starts at $PSTART, not $BS-aligned"
+  DEV=${P%%:*}; REST=${P#*:}; PSTART=${REST%%:*}; PSIZE=${REST#*:}
+  [ $((PSTART % BS)) -eq 0 ] && [ $((PSIZE % BS)) -eq 0 ] || abort "$DEV is not $BS-aligned"
   FLAGS=$(cat /sys/class/mtd/$DEV/flags 2>/dev/null)
   [ -n "$FLAGS" ] || abort "cannot read /sys/class/mtd/$DEV/flags"
   [ $((FLAGS & 0x400)) -ne 0 ] || abort "$DEV is read-only"
@@ -145,18 +155,20 @@ rm -f /tmp/verify.bin
 
 echo ""
 echo "[3/6] Splitting stock partitions..."
-echo "  mtdparts: 192K(uboot) 4544K(boot) 5632K(system) 5632K(back) 320K(cfg) 64K(provisioning)"
 
 SKIP=0
 NAMES=""
-for p in $STOCK_LAYOUT; do
-  NAME=${p%%:*}; KB=${p#*:}
-  echo "  $NAME..."
-  dd if=$BDIR/full-backup.bin of=$BDIR/$NAME.bin bs=1024 skip=$SKIP count=$KB 2>/dev/null
-  [ $(wc -c < $BDIR/$NAME.bin) -eq $((KB * 1024)) ] || abort "$NAME.bin has the wrong size"
-  SKIP=$((SKIP + KB))
+TOTAL=0
+for p in $LAYOUT; do
+  NAME=${p%%:*}; SIZE=${p#*:}
+  echo "  $NAME ($((SIZE / 1024)) KiB)..."
+  dd if=$BDIR/full-backup.bin of=$BDIR/$NAME.bin bs=$BS skip=$SKIP count=$((SIZE / BS)) 2>/dev/null
+  [ $(wc -c < $BDIR/$NAME.bin) -eq $SIZE ] || abort "$NAME.bin has the wrong size"
+  SKIP=$((SKIP + SIZE / BS))
+  TOTAL=$((TOTAL + SIZE))
   NAMES="$NAMES $BDIR/$NAME.bin"
 done
+[ $TOTAL -eq $CHIP_SIZE ] || abort "partition layout covers $TOTAL bytes"
 
 sha256sum $NAMES > $BDIR/partitions.sha256
 cat $BDIR/partitions.sha256
@@ -192,23 +204,44 @@ install_once() {
   return 0
 }
 
+# Write the verified backup back over the whole chip
+restore_stock() {
+  [ "$(sha $BDIR/full-backup.bin)" = "$H1" ] || { echo "  Backup on SD changed, not restoring"; return 1; }
+  echo "  Erasing flash..."
+  for P in $PARTS; do
+    flash_eraseall /dev/${P%%:*} 2>&1 || return 1
+  done
+  echo "  Writing stock firmware (16 MiB)..."
+  chip_io w $BDIR/full-backup.bin 0 $CHIP_SIZE || return 1
+  sync
+  echo "  Verifying..."
+  verify_range $BDIR/full-backup.bin 0
+}
+
 if ! install_once; then
   echo "  Retrying install..."
   install_once || FAIL=1
 fi
-
-umount $SDMNT 2>/dev/null
 
 echo ""
 if [ "$FAIL" = "1" ]; then
   echo "======================================"
   echo "  INSTALL FAILED"
   echo "======================================"
-  echo "The stock firmware is erased and thingino U-Boot did not verify."
-  echo "Not rebooting. Restore wyze-backup-panv4/full-backup.bin with an"
-  echo "SPI programmer."
+  echo "Restoring the stock firmware from the SD backup..."
+  if restore_stock || restore_stock; then
+    echo "  Stock firmware restored and verified."
+    echo "Remove the SD card, then power-cycle: the camera boots stock."
+  else
+    echo "  Restore FAILED."
+    echo "Restore wyze-backup-panv4/full-backup.bin with an SPI programmer."
+  fi
+  umount $SDMNT 2>/dev/null
+  # No reboot: with the SD card still in, stock U-Boot would run this again
   while true; do sleep 3600; done
 fi
+
+umount $SDMNT 2>/dev/null
 
 echo "======================================"
 echo "  INSTALLATION COMPLETE"
@@ -216,13 +249,10 @@ echo "======================================"
 
 echo ""
 echo "Stock backup on SD: wyze-backup-panv4/"
-echo "  full-backup.bin    16 MiB  complete NOR dump"
-echo "  uboot.bin         192 KiB  stock SPL + U-Boot"
-echo "  boot.bin          4.4 MiB  stock FIT (kernel+ramdisk+dtb)"
-echo "  system.bin        5.5 MiB  stock system partition"
-echo "  back.bin          5.5 MiB  stock backup partition"
-echo "  cfg.bin           320 KiB  stock config (JFFS2)"
-echo "  provisioning.bin   64 KiB  stock provisioning"
+echo "  full-backup.bin  16384 KiB  complete NOR dump"
+for p in $LAYOUT; do
+  echo "  ${p%%:*}.bin  $((${p#*:} / 1024)) KiB"
+done
 
 sleep 3
 reboot -f
