@@ -3,3 +3,4 @@ factory_wcpanv4_uvc
 *.bin.bak
 sdcard.img
 fat.part
+__pycache__/

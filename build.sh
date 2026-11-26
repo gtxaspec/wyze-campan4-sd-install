@@ -16,8 +16,8 @@ done
 chmod 1777 "rootfs/tmp"
 
 # Copy U-Boot and env into rootfs
-cp "$UBOOT" rootfs/uboot.bin
-cp "$ENV" rootfs/uboot-env.bin
+[ "$UBOOT" -ef rootfs/uboot.bin ] || cp "$UBOOT" rootfs/uboot.bin
+[ "$ENV" -ef rootfs/uboot-env.bin ] || cp "$ENV" rootfs/uboot-env.bin
 
 # Build squashfs ramdisk
 rm -f installer.sqfs
