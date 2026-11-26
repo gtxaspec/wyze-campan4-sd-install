@@ -47,9 +47,9 @@ wyze-backup-panv4/
   partitions.sha256             SHA256 of all partitions
 ```
 
-Each partition is read twice from NOR and SHA256-verified before any
-writes happen. If any verification fails, the installer aborts without
-touching the flash.
+The whole chip is read twice and SHA256-verified, and each file is
+size-checked, before any writes happen. If any check fails, the installer
+aborts without touching the flash.
 
 ## Restoring stock firmware
 

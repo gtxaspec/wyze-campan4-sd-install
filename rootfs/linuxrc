@@ -5,7 +5,9 @@ mount -t sysfs sys /sys
 mount -t tmpfs tmpfs /tmp
 mount -t devtmpfs dev /dev 2>/dev/null || {
   mkdir -p /dev
-  mknod /dev/mtd0 c 90 0
+  for n in 0 1 2 3 4 5 6 7; do
+    mknod /dev/mtd$n c 90 $((n * 2))
+  done
   mknod /dev/console c 5 1
   mknod /dev/null c 1 3
 }
@@ -15,10 +17,73 @@ echo "======================================"
 echo "  THINGINO INSTALLER - Wyze Pan v4"
 echo "======================================"
 
-NOR=/dev/mtd0
 SDMNT=/tmp/sd
 BDIR=$SDMNT/wyze-backup-panv4
+CHIP_SIZE=16777216
+UBOOT_OFF=0
+ENV_OFF=327680
+BS=4096
+STOCK_LAYOUT="uboot:192 boot:4544 system:5632 back:5632 cfg:320 provisioning:64"
 FAIL=0
+
+abort() {
+  echo "ERROR: $1"
+  echo "Aborting - NOR is untouched."
+  umount $SDMNT 2>/dev/null
+  sleep 30
+  reboot -f
+}
+
+sha() {
+  sha256sum "$1" | dd bs=64 count=1 2>/dev/null
+}
+
+# The stock kernel splits the chip with mtdparts, so /dev/mtd0 is only the
+# 192 KiB uboot partition. Map chip offsets onto the mtd devices instead.
+PARTS=""
+OFF=0
+while read -r DEV SIZE ESIZE NAME; do
+  case "$DEV" in mtd*:) ;; *) continue ;; esac
+  SIZE=$((0x$SIZE))
+  PARTS="$PARTS ${DEV%:}:$OFF:$SIZE"
+  OFF=$((OFF + SIZE))
+done < /proc/mtd
+
+# chip_io r|w FILE CHIPOFF LEN: copy LEN bytes between FILE (from its start)
+# and the chip at CHIPOFF, across partition boundaries.
+chip_io() {
+  local MODE=$1 FILE=$2 START=$3 LEN=$4
+  local END P DEV REST PSTART PSIZE PEND A B FOFF DOFF CNT
+  END=$((START + LEN))
+  for P in $PARTS; do
+    DEV=${P%%:*}; REST=${P#*:}; PSTART=${REST%%:*}; PSIZE=${REST#*:}
+    PEND=$((PSTART + PSIZE))
+    A=$START; [ $PSTART -gt $A ] && A=$PSTART
+    B=$END; [ $PEND -lt $B ] && B=$PEND
+    [ $A -lt $B ] || continue
+    FOFF=$(((A - START) / BS))
+    DOFF=$(((A - PSTART) / BS))
+    CNT=$(((B - A + BS - 1) / BS))
+    if [ "$MODE" = r ]; then
+      dd if=/dev/$DEV of="$FILE" bs=$BS skip=$DOFF seek=$FOFF count=$CNT conv=notrunc 2>/dev/null || return 1
+    else
+      dd if="$FILE" of=/dev/$DEV bs=$BS skip=$FOFF seek=$DOFF count=$CNT conv=notrunc 2>/dev/null || return 1
+    fi
+  done
+  return 0
+}
+
+# verify_range FILE CHIPOFF: read the range back and compare with FILE
+verify_range() {
+  local LEN H_A H_B
+  LEN=$(wc -c < "$1")
+  rm -f /tmp/rb.bin
+  chip_io r /tmp/rb.bin $2 $LEN || return 1
+  H_A=$(dd if=/tmp/rb.bin bs=$LEN count=1 2>/dev/null | sha256sum | dd bs=64 count=1 2>/dev/null)
+  H_B=$(sha "$1")
+  rm -f /tmp/rb.bin
+  [ "$H_A" = "$H_B" ]
+}
 
 echo ""
 echo "[1/6] Mounting SD card..."
@@ -31,113 +96,105 @@ if [ $? -ne 0 ]; then
   reboot -f
 fi
 
+echo ""
+echo "  MTD layout:"
+cat /proc/mtd
+[ $OFF -eq $CHIP_SIZE ] || abort "MTD partitions cover $OFF bytes, expected $CHIP_SIZE"
+for P in $PARTS; do
+  DEV=${P%%:*}; REST=${P#*:}; PSTART=${REST%%:*}
+  [ $((PSTART % BS)) -eq 0 ] || abort "$DEV starts at $PSTART, not $BS-aligned"
+  FLAGS=$(cat /sys/class/mtd/$DEV/flags 2>/dev/null)
+  [ -n "$FLAGS" ] || abort "cannot read /sys/class/mtd/$DEV/flags"
+  [ $((FLAGS & 0x400)) -ne 0 ] || abort "$DEV is read-only"
+  [ -c /dev/$DEV ] || abort "/dev/$DEV missing"
+done
+
+UBOOT_SZ=$(wc -c < /uboot.bin)
+ENV_SZ=$(wc -c < /uboot-env.bin)
+[ $((UBOOT_OFF + UBOOT_SZ)) -le $ENV_OFF ] || abort "uboot.bin ($UBOOT_SZ bytes) overlaps the env"
+[ $((ENV_OFF + ENV_SZ)) -le $CHIP_SIZE ] || abort "uboot-env.bin does not fit"
+
 mkdir -p "$BDIR"
 
 echo ""
 echo "[2/6] Backing up NOR flash (16 MiB)..."
 
 echo "  Reading first copy..."
-dd if=$NOR of=$BDIR/full-backup.bin bs=4096 2>&1
+rm -f $BDIR/full-backup.bin
+chip_io r $BDIR/full-backup.bin 0 $CHIP_SIZE || abort "flash read failed"
 sync
+[ $(wc -c < $BDIR/full-backup.bin) -eq $CHIP_SIZE ] || abort "backup is not $CHIP_SIZE bytes"
 
 echo "  SHA256 first copy..."
 sha256sum $BDIR/full-backup.bin > $BDIR/full-backup.sha256
 cat $BDIR/full-backup.sha256
 
 echo "  Reading second copy for verification..."
-dd if=$NOR of=/tmp/verify.bin bs=4096 2>&1
+rm -f /tmp/verify.bin
+chip_io r /tmp/verify.bin 0 $CHIP_SIZE || abort "flash read failed"
 
-H1=$(sha256sum $BDIR/full-backup.bin | dd bs=64 count=1 2>/dev/null)
-H2=$(sha256sum /tmp/verify.bin | dd bs=64 count=1 2>/dev/null)
+H1=$(sha $BDIR/full-backup.bin)
+H2=$(sha /tmp/verify.bin)
 if [ "$H1" != "$H2" ]; then
-  echo "ERROR: backup verification FAILED!"
   echo "  Copy 1: $H1"
   echo "  Copy 2: $H2"
-  echo "Aborting - NOR is untouched."
-  umount $SDMNT 2>/dev/null
-  sleep 30
-  reboot -f
+  abort "backup verification FAILED"
 fi
 echo "  Backup verified OK"
 rm -f /tmp/verify.bin
 
 echo ""
-echo "[3/6] Backing up individual stock partitions..."
+echo "[3/6] Splitting stock partitions..."
 echo "  mtdparts: 192K(uboot) 4544K(boot) 5632K(system) 5632K(back) 320K(cfg) 64K(provisioning)"
 
-PARTS="uboot:0:48 boot:48:1136 system:1184:1408 back:2592:1408 cfg:4000:80 provisioning:4080:16"
-
-for p in $PARTS; do
-  NAME=${p%%:*}; rest=${p#*:}; SKIP=${rest%%:*}; CNT=${rest#*:}
+SKIP=0
+NAMES=""
+for p in $STOCK_LAYOUT; do
+  NAME=${p%%:*}; KB=${p#*:}
   echo "  $NAME..."
-  dd if=$NOR of=$BDIR/$NAME.bin bs=4096 skip=$SKIP count=$CNT 2>/dev/null
-  dd if=$NOR of=/tmp/$NAME-v.bin bs=4096 skip=$SKIP count=$CNT 2>/dev/null
-  H_A=$(sha256sum $BDIR/$NAME.bin | dd bs=64 count=1 2>/dev/null)
-  H_B=$(sha256sum /tmp/$NAME-v.bin | dd bs=64 count=1 2>/dev/null)
-  if [ "$H_A" != "$H_B" ]; then
-    echo "  ERROR: $NAME verify FAILED!"
-    echo "    Copy 1: $H_A"
-    echo "    Copy 2: $H_B"
-    echo "  Aborting - NOR is untouched."
-    umount $SDMNT 2>/dev/null
-    sleep 30
-    reboot -f
-  fi
-  rm -f /tmp/$NAME-v.bin
+  dd if=$BDIR/full-backup.bin of=$BDIR/$NAME.bin bs=1024 skip=$SKIP count=$KB 2>/dev/null
+  [ $(wc -c < $BDIR/$NAME.bin) -eq $((KB * 1024)) ] || abort "$NAME.bin has the wrong size"
+  SKIP=$((SKIP + KB))
+  NAMES="$NAMES $BDIR/$NAME.bin"
 done
 
-sha256sum $BDIR/uboot.bin $BDIR/boot.bin $BDIR/system.bin $BDIR/back.bin $BDIR/cfg.bin $BDIR/provisioning.bin > $BDIR/partitions.sha256
+sha256sum $NAMES > $BDIR/partitions.sha256
 cat $BDIR/partitions.sha256
 
 echo ""
 echo "[4/6] Verifying partition split against full backup..."
-cat $BDIR/uboot.bin $BDIR/boot.bin $BDIR/system.bin $BDIR/back.bin $BDIR/cfg.bin $BDIR/provisioning.bin > /tmp/reassembled.bin
-H3=$(sha256sum /tmp/reassembled.bin | dd bs=64 count=1 2>/dev/null)
-if [ "$H1" != "$H3" ]; then
-  echo "ERROR: reassembly mismatch! Aborting."
-  umount $SDMNT 2>/dev/null
-  sleep 30
-  reboot -f
-fi
-echo "  Reassembly verified OK"
+cat $NAMES > /tmp/reassembled.bin
+H3=$(sha /tmp/reassembled.bin)
 rm -f /tmp/reassembled.bin
+[ "$H1" = "$H3" ] || abort "reassembly mismatch"
+echo "  Reassembly verified OK"
 sync
 
 echo ""
 echo "[5/6] Installing thingino..."
 
-echo "  Erasing flash..."
-flash_eraseall $NOR 2>&1
-
-echo "  Writing U-Boot (0x0)..."
-dd if=/uboot.bin of=$NOR bs=256 2>&1
-
-echo "  Writing env (0x50000)..."
-dd if=/uboot-env.bin of=$NOR bs=256 seek=1280 2>&1
-sync
-
-echo ""
-echo "[6/6] Verifying install..."
-
-UBOOT_SZ=$(wc -c < /uboot.bin)
-dd if=$NOR of=/tmp/uboot-rb.bin bs=1 count=$UBOOT_SZ 2>/dev/null
-H4=$(sha256sum /tmp/uboot-rb.bin | dd bs=64 count=1 2>/dev/null)
-H5=$(sha256sum /uboot.bin | dd bs=64 count=1 2>/dev/null)
-if [ "$H4" != "$H5" ]; then
-  echo "  WARNING: U-Boot verify failed!"
-  FAIL=1
-else
+install_once() {
+  echo "  Erasing flash..."
+  for P in $PARTS; do
+    flash_eraseall /dev/${P%%:*} 2>&1 || return 1
+  done
+  echo "  Writing U-Boot (0x0)..."
+  chip_io w /uboot.bin $UBOOT_OFF $UBOOT_SZ || return 1
+  echo "  Writing env (0x50000)..."
+  chip_io w /uboot-env.bin $ENV_OFF $ENV_SZ || return 1
+  sync
+  echo ""
+  echo "[6/6] Verifying install..."
+  verify_range /uboot.bin $UBOOT_OFF || { echo "  U-Boot verify FAILED"; return 1; }
   echo "  U-Boot verified OK"
-fi
-
-dd if=$NOR of=/tmp/env-rb.bin bs=256 skip=1280 count=256 2>/dev/null
-H6=$(sha256sum /tmp/env-rb.bin | dd bs=64 count=1 2>/dev/null)
-H7=$(sha256sum /uboot-env.bin | dd bs=64 count=1 2>/dev/null)
-if [ "$H6" != "$H7" ]; then
-  echo "  WARNING: env verify failed!"
-  FAIL=1
-else
+  verify_range /uboot-env.bin $ENV_OFF || { echo "  Env verify FAILED"; return 1; }
   echo "  Env verified OK"
+  return 0
+}
+
+if ! install_once; then
+  echo "  Retrying install..."
+  install_once || FAIL=1
 fi
 
 umount $SDMNT 2>/dev/null
@@ -145,13 +202,17 @@ umount $SDMNT 2>/dev/null
 echo ""
 if [ "$FAIL" = "1" ]; then
   echo "======================================"
-  echo "  INSTALL COMPLETED WITH WARNINGS"
+  echo "  INSTALL FAILED"
   echo "======================================"
-else
-  echo "======================================"
-  echo "  INSTALLATION COMPLETE"
-  echo "======================================"
+  echo "The stock firmware is erased and thingino U-Boot did not verify."
+  echo "Not rebooting. Restore wyze-backup-panv4/full-backup.bin with an"
+  echo "SPI programmer."
+  while true; do sleep 3600; done
 fi
+
+echo "======================================"
+echo "  INSTALLATION COMPLETE"
+echo "======================================"
 
 echo ""
 echo "Stock backup on SD: wyze-backup-panv4/"
